@@ -1,0 +1,331 @@
+import React, { useState, useEffect, useMemo, useRef } from 'react';
+import { 
+  Plus, Trash2, TrendingUp, Activity, X, Home, List, 
+  Image as ImageIcon, ExternalLink, Camera, Sparkles, Zap, Settings, Key
+} from 'lucide-react';
+import { LineChart, Line, YAxis, Tooltip as RechartsTooltip, ResponsiveContainer } from 'recharts';
+
+// --- Helper: Compress Image ---
+const compressImage = (file) => {
+  return new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.readAsDataURL(file);
+    reader.onload = (e) => {
+      const img = new Image();
+      img.src = e.target.result;
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        const MAX_WIDTH = 600; // Reduce size for LocalStorage limits
+        const scale = MAX_WIDTH / img.width;
+        canvas.width = MAX_WIDTH;
+        canvas.height = img.height * scale;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        resolve(canvas.toDataURL('image/jpeg', 0.5));
+      };
+    };
+  });
+};
+
+const getCurrentDateTime = () => {
+  const now = new Date();
+  now.setMinutes(now.getMinutes() - now.getTimezoneOffset());
+  return now.toISOString().slice(0, 16);
+};
+
+export default function LocalTradingApp() {
+  // --- LocalStorage Initialization ---
+  // Load trades from local storage on startup
+  const [trades, setTrades] = useState(() => {
+    if (typeof window !== 'undefined') {
+      const saved = localStorage.getItem('local_trades');
+      return saved ? JSON.parse(saved) : [];
+    }
+    return [];
+  });
+
+  // Load API Key from local storage
+  const [apiKey, setApiKey] = useState(() => {
+    if (typeof window !== 'undefined') {
+      return localStorage.getItem('gemini_api_key') || '';
+    }
+    return '';
+  });
+
+  // --- States ---
+  const [activeTab, setActiveTab] = useState('dashboard');
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [viewImage, setViewImage] = useState(null);
+  const [isUploading, setIsUploading] = useState(false);
+  
+  // AI States
+  const [isRefiningNotes, setIsRefiningNotes] = useState(false);
+  const [aiReviewModal, setAiReviewModal] = useState(null);
+  const [aiReviewResult, setAiReviewResult] = useState('');
+  const [isAiReviewLoading, setIsAiReviewLoading] = useState(false);
+
+  const fileInputRef = useRef(null);
+  const [formData, setFormData] = useState({
+    id: '', symbol: '', direction: 'Long', timeframe: '1H', pnl: '',
+    date: getCurrentDateTime(), imageUrl: '', entryExitNotes: '', reviewNotes: ''
+  });
+  const timeframes = ['1m', '5m', '15m', '30m', '1H', '4H', 'Daily', 'Weekly'];
+
+  // --- Effects: Auto-save to LocalStorage ---
+  useEffect(() => {
+    localStorage.setItem('local_trades', JSON.stringify(trades));
+  }, [trades]);
+
+  useEffect(() => {
+    localStorage.setItem('gemini_api_key', apiKey);
+  }, [apiKey]);
+
+  // --- API Helpers ---
+  const callGemini = async (prompt) => {
+    if (!apiKey) return "請先在設定中輸入 Gemini API Key";
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`;
+    const payload = { contents: [{ parts: [{ text: prompt }] }] };
+    try {
+      const response = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+      const data = await response.json();
+      return data.candidates?.[0]?.content?.parts?.[0]?.text || "AI 無法回應 (請檢查 Key)";
+    } catch (e) { return "網路連線錯誤"; }
+  };
+
+  // --- Handlers ---
+  const handleInputChange = (e) => setFormData(prev => ({ ...prev, [e.target.name]: e.target.value }));
+  
+  const handleImageUpload = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    setIsUploading(true);
+    try {
+      // LocalStorage has 5MB limit usually. We must compress heavily.
+      const base64 = await compressImage(file);
+      // Check rough size
+      if (base64.length > 3000000) {
+        alert("圖片壓縮後仍太大，無法儲存於本機。請改用連結或更小的圖片。");
+        setFormData(prev => ({ ...prev, imageUrl: '' }));
+      } else {
+        setFormData(prev => ({ ...prev, imageUrl: base64 }));
+      }
+    } catch(e) { alert("圖片處理失敗"); } finally { setIsUploading(false); }
+  };
+
+  const handleRefineNotes = async () => {
+    if (!formData.entryExitNotes && !formData.reviewNotes) return alert("請先輸入筆記");
+    setIsRefiningNotes(true);
+    try {
+      const prompt = `優化以下交易筆記(繁體中文),回傳JSON格式{"entryExit":"...","review":"..."}:\n進出:${formData.entryExitNotes}\n檢討:${formData.reviewNotes}`;
+      const res = await callGemini(prompt);
+      const clean = res.replace(/```json|```/g, '').trim();
+      try {
+        const parsed = JSON.parse(clean);
+        setFormData(prev => ({...prev, entryExitNotes: parsed.entryExit||prev.entryExitNotes, reviewNotes: parsed.review||prev.reviewNotes}));
+      } catch (e) {
+        setFormData(prev => ({...prev, reviewNotes: res})); // Fallback
+      }
+    } catch(e) { alert("AI忙碌中"); } finally { setIsRefiningNotes(false); }
+  };
+
+  const openAiReview = async (trade) => {
+    setAiReviewModal(trade); setAiReviewResult(''); setIsAiReviewLoading(true);
+    try {
+      const prompt = `交易復盤(繁體中文),用HTML清單<ul><li>格式回傳3點建議:\n${JSON.stringify(trade)}`;
+      const res = await callGemini(prompt);
+      setAiReviewResult(res.replace(/```html|```/g, '').trim());
+    } catch(e) { setAiReviewResult("AI 暫時無法使用"); } finally { setIsAiReviewLoading(false); }
+  };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    if (!formData.symbol || !formData.pnl) return alert('資訊不完整');
+    
+    const newTrade = {
+      ...formData,
+      id: Date.now().toString(), // Simple ID
+      pnl: parseFloat(formData.pnl),
+      date: getCurrentDateTime(),
+      isWin: parseFloat(formData.pnl) > 0
+    };
+
+    // Update Local State directly
+    setTrades(prev => [newTrade, ...prev]);
+    
+    setIsModalOpen(false);
+    setFormData({ id: '', symbol: '', direction: 'Long', timeframe: '1H', pnl: '', date: getCurrentDateTime(), imageUrl: '', entryExitNotes: '', reviewNotes: '' });
+    setActiveTab('history');
+  };
+
+  const handleDelete = (id, e) => {
+    e.stopPropagation();
+    if(window.confirm('刪除此記錄？')) {
+      setTrades(prev => prev.filter(t => t.id !== id));
+    }
+  };
+
+  const handleClearAll = () => {
+    if(window.confirm('警告：這將刪除手機內所有交易記錄！確定嗎？')) {
+      setTrades([]);
+      localStorage.removeItem('local_trades');
+      setIsSettingsOpen(false);
+    }
+  };
+
+  const formatCurrency = (val) => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 0 }).format(val);
+
+  const stats = useMemo(() => {
+    const totalPnL = trades.reduce((acc, curr) => acc + (curr.pnl || 0), 0);
+    const wins = trades.filter(t => t.pnl > 0).length;
+    let running = 0;
+    // Sort chronological for chart
+    const chartData = [...trades]
+      .sort((a,b)=>new Date(a.date)-new Date(b.date))
+      .map(t => ({ date: t.date.substring(5).replace('T',' '), pnl: (running+=t.pnl) }));
+    
+    return { 
+      totalTrades: trades.length, 
+      totalPnL, 
+      winRate: trades.length ? ((wins/trades.length)*100).toFixed(0) : 0,
+      chartData
+    };
+  }, [trades]);
+
+  // --- UI ---
+  return (
+    <div className="h-screen bg-black text-zinc-200 font-sans flex flex-col overflow-hidden">
+      {/* Top Bar */}
+      <div className="flex-none h-14 border-b border-zinc-900 bg-black/80 backdrop-blur flex items-center justify-between px-4 z-20">
+        <span className="font-bold text-lg text-white flex items-center gap-2">
+          <Activity size={20} className="text-zinc-100" />
+          TradeLog <span className="text-[10px] bg-zinc-800 text-zinc-400 px-1 rounded border border-zinc-700">Local</span>
+        </span>
+        <div className="flex items-center gap-3">
+           <button onClick={() => setIsSettingsOpen(true)} className="text-zinc-500 hover:text-white"><Settings size={20} /></button>
+           <button onClick={() => setIsModalOpen(true)} className="bg-zinc-100 hover:bg-zinc-200 text-black p-2 rounded-full shadow-lg"><Plus size={20} /></button>
+        </div>
+      </div>
+
+      {/* Content Area */}
+      <div className="flex-1 overflow-y-auto pb-20 sm:pb-8">
+        <div className="max-w-3xl mx-auto px-4 py-6 space-y-6">
+          {activeTab === 'dashboard' && (
+            <div className="space-y-6 animation-fade-in">
+              <div className="bg-zinc-900/50 border border-zinc-800 rounded-2xl p-5 shadow-sm">
+                <div className="flex justify-between items-end mb-4">
+                  <div>
+                    <p className="text-zinc-500 text-xs uppercase mb-1">淨盈虧 Net P&L</p>
+                    <h2 className={`text-3xl font-bold ${stats.totalPnL>=0?'text-white':'text-rose-400'}`}>{formatCurrency(stats.totalPnL)}</h2>
+                  </div>
+                  <div className="text-right"><p className="text-zinc-500 text-xs mb-1">勝率</p><p className="text-xl font-medium text-emerald-400">{stats.winRate}%</p></div>
+                </div>
+                <div className="h-40 w-full">
+                  {stats.chartData.length ? (
+                    <ResponsiveContainer width="100%" height="100%">
+                      <LineChart data={stats.chartData}>
+                        <Line type="monotone" dataKey="pnl" stroke="#fff" strokeWidth={2} dot={false} />
+                        <YAxis hide domain={['auto', 'auto']} />
+                        <RechartsTooltip contentStyle={{background:'#000', border:'1px solid #333'}} itemStyle={{color:'#fff'}} labelStyle={{display:'none'}} formatter={(v)=>[formatCurrency(v),'']} />
+                      </LineChart>
+                    </ResponsiveContainer>
+                  ) : <div className="h-full flex items-center justify-center text-zinc-800 text-xs">尚無數據</div>}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {(activeTab === 'history' || activeTab === 'dashboard') && (
+            <div className={`space-y-4 ${activeTab === 'dashboard' ? 'hidden sm:block' : 'animation-fade-in'}`}>
+              <div className="flex justify-between items-center"><h3 className="text-zinc-400 text-sm font-medium">交易歷史</h3>{activeTab === 'dashboard' && <button onClick={()=>setActiveTab('history')} className="text-xs text-zinc-500">查看全部</button>}</div>
+              {trades.length === 0 ? <div className="text-center py-12 text-zinc-700 text-sm">尚無記錄 (存於本機)</div> : 
+                trades.map((t) => (
+                  <div key={t.id} className="bg-zinc-900 border border-zinc-800/50 p-4 rounded-xl flex flex-col gap-3">
+                    <div className="flex justify-between items-start">
+                      <div className="flex flex-col gap-1">
+                        <div className="flex items-center gap-2">
+                          <span className="font-bold text-zinc-100">{t.symbol}</span>
+                          <span className={`text-[10px] px-1.5 py-0.5 rounded ${t.direction === 'Long' ? 'bg-emerald-900/20 text-emerald-400' : 'bg-rose-900/20 text-rose-400'}`}>{t.direction}</span>
+                          <span className="text-[10px] bg-zinc-800 text-zinc-400 px-1.5 py-0.5 rounded">{t.timeframe}</span>
+                        </div>
+                        <div className="flex items-center gap-2 text-xs text-zinc-500"><span>{t.date.replace('T', ' ')}</span>{t.imageUrl && <ImageIcon size={12}/>}</div>
+                      </div>
+                      <div className={`font-mono font-medium ${t.pnl>0?'text-zinc-100':'text-zinc-500'}`}>{t.pnl>0?'+':''}{formatCurrency(t.pnl)}</div>
+                    </div>
+                    <div className="flex justify-end items-center gap-3 pt-2 border-t border-zinc-800/50 mt-1">
+                       <button onClick={()=>openAiReview(t)} className="flex items-center gap-1.5 text-xs text-indigo-400 hover:bg-indigo-900/20 px-2 py-1 rounded"><Sparkles size={14} /> AI 復盤</button>
+                       <div className="h-3 w-px bg-zinc-800"></div>
+                       {t.imageUrl && <button onClick={()=>setViewImage(t.imageUrl)} className="p-1 text-zinc-600 hover:text-white"><ExternalLink size={16}/></button>}
+                       <button onClick={(e)=>handleDelete(t.id, e)} className="p-1 text-zinc-600 hover:text-rose-400"><Trash2 size={16}/></button>
+                    </div>
+                  </div>
+                ))
+              }
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Bottom Nav */}
+      <div className="sm:hidden flex-none border-t border-zinc-900 bg-black safe-area-bottom z-30">
+        <div className="flex justify-around items-center h-16">
+          <button onClick={()=>setActiveTab('dashboard')} className={`flex flex-col items-center gap-1 w-full ${activeTab==='dashboard'?'text-white':'text-zinc-600'}`}><Home size={22}/><span className="text-[10px]">總覽</span></button>
+          <button onClick={()=>setActiveTab('history')} className={`flex flex-col items-center gap-1 w-full ${activeTab==='history'?'text-white':'text-zinc-600'}`}><List size={22}/><span className="text-[10px]">記錄</span></button>
+        </div>
+      </div>
+
+      {/* Add Modal */}
+      {isModalOpen && (
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-end sm:items-center justify-center sm:p-4">
+          <div className="bg-zinc-900 w-full max-w-md sm:rounded-2xl rounded-t-2xl border border-zinc-800 overflow-hidden animation-slide-up">
+            <div className="px-5 py-4 border-b border-zinc-800 flex justify-between items-center"><span className="font-bold text-white">新增記錄 {isRefiningNotes && "(AI優化中...)"}</span><button onClick={()=>setIsModalOpen(false)}><X size={20} className="text-zinc-500"/></button></div>
+            <form onSubmit={handleSubmit} className="p-5 space-y-4 max-h-[80vh] overflow-y-auto">
+              <div className="grid grid-cols-2 gap-4"><input name="symbol" placeholder="BTC" value={formData.symbol} onChange={handleInputChange} className="input-dark"/><input name="pnl" type="number" placeholder="盈虧" value={formData.pnl} onChange={handleInputChange} className="input-dark"/></div>
+              <div className="grid grid-cols-2 gap-4">
+                  <select name="direction" value={formData.direction} onChange={handleInputChange} className="input-dark"><option value="Long">做多</option><option value="Short">做空</option></select>
+                  <select name="timeframe" value={formData.timeframe} onChange={handleInputChange} className="input-dark">{timeframes.map(tf=><option key={tf} value={tf}>{tf}</option>)}</select>
+              </div>
+              <div className="space-y-2"><input type="file" ref={fileInputRef} onChange={handleImageUpload} className="hidden"/><button type="button" onClick={()=>fileInputRef.current?.click()} className="w-full border border-dashed border-zinc-700 bg-zinc-900/50 p-4 text-zinc-400 rounded-xl flex flex-col items-center justify-center gap-2">{isUploading?"處理中...":formData.imageUrl?<img src={formData.imageUrl} className="h-24 rounded object-contain"/>:<><Camera size={24}/><span className="text-xs">上傳截圖 (本機存儲)</span></>}</button></div>
+              <div className="space-y-1"><div className="flex justify-between"><label className="text-xs text-zinc-500">進出場</label><button type="button" onClick={handleRefineNotes} className="text-[10px] text-indigo-400 flex items-center gap-1"><Sparkles size={10}/> AI優化</button></div><textarea name="entryExitNotes" rows="2" value={formData.entryExitNotes} onChange={handleInputChange} className="input-dark"/></div>
+              <div className="space-y-1"><label className="text-xs text-zinc-500">檢討</label><textarea name="reviewNotes" rows="2" value={formData.reviewNotes} onChange={handleInputChange} className="input-dark"/></div>
+              <button type="submit" className="w-full bg-white text-black font-bold py-3.5 rounded-xl shadow-lg">儲存</button>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Settings Modal (For API Key & Clear Data) */}
+      {isSettingsOpen && (
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4" onClick={()=>setIsSettingsOpen(false)}>
+          <div className="bg-zinc-900 w-full max-w-sm rounded-2xl border border-zinc-800 p-6 space-y-4" onClick={e=>e.stopPropagation()}>
+            <h3 className="text-lg font-bold text-white flex items-center gap-2"><Settings size={20}/> 設定</h3>
+            
+            <div className="space-y-2">
+              <label className="text-xs text-zinc-500">Gemini API Key (用於 AI 功能)</label>
+              <div className="flex gap-2">
+                <input type="password" value={apiKey} onChange={(e)=>setApiKey(e.target.value)} placeholder="貼上您的 API Key" className="input-dark flex-1"/>
+              </div>
+              <p className="text-[10px] text-zinc-600">您的 Key 只會儲存在這台手機中。</p>
+            </div>
+
+            <div className="pt-4 border-t border-zinc-800">
+               <button onClick={handleClearAll} className="w-full bg-rose-900/20 text-rose-400 py-3 rounded-xl text-sm font-medium hover:bg-rose-900/30">清除所有本機資料</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {aiReviewModal && (
+         <div className="fixed inset-0 z-[60] bg-black/90 flex items-center justify-center p-4" onClick={()=>setAiReviewModal(null)}>
+           <div className="bg-zinc-900 w-full max-w-lg rounded-2xl border border-zinc-800 overflow-hidden" onClick={e=>e.stopPropagation()}>
+             <div className="p-5 border-b border-zinc-800 flex justify-between bg-zinc-950"><div className="flex gap-2 text-white font-bold"><Zap className="text-yellow-400"/> AI 復盤</div><button onClick={()=>setAiReviewModal(null)}><X size={20} className="text-zinc-500"/></button></div>
+             <div className="p-6 max-h-[70vh] overflow-y-auto">{isAiReviewLoading ? <div className="text-center py-8 text-zinc-400 animate-pulse">AI 正在分析... (需網路)</div> : <div className="prose prose-invert prose-sm" dangerouslySetInnerHTML={{__html: aiReviewResult}}/>}</div>
+           </div>
+         </div>
+      )}
+
+      {viewImage && <div className="fixed inset-0 z-[60] bg-black flex items-center justify-center p-2" onClick={()=>setViewImage(null)}><img src={viewImage} className="max-w-full max-h-[90vh] object-contain rounded"/><button className="absolute top-4 right-4 bg-zinc-800 p-2 rounded-full text-white"><X size={20}/></button></div>}
+      <style>{`.input-dark{width:100%;background:#18181b;border:1px solid #27272a;border-radius:0.75rem;padding:0.75rem;color:white;outline:none;font-size:0.9rem;}.input-dark:focus{border-color:#71717a}.safe-area-bottom{padding-bottom:env(safe-area-inset-bottom)}.animation-slide-up{animation:slideUp 0.3s cubic-bezier(0.16,1,0.3,1)}@keyframes slideUp{from{transform:translateY(100%)}to{transform:translateY(0)}} ul{padding-left:1.2rem;list-style:disc}li{margin-bottom:0.5rem}`}</style>
+    </div>
+  );
+}
